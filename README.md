@@ -24,6 +24,7 @@ cd ~/Downloads/MyProject
 - [`--all` mode](#--all-mode)
 - [Large files and Git LFS](#large-files-and-git-lfs)
 - [The script never uploads itself](#the-script-never-uploads-itself)
+- [Account switching and overwriting](#account-switching-and-overwriting)
 - [Safety features](#safety-features)
 - [Dependencies and login](#dependencies-and-login)
 - [Output, summary and exit codes](#output-summary-and-exit-codes)
@@ -37,9 +38,12 @@ cd ~/Downloads/MyProject
 - **One command.** Run `./gitup.sh` inside a project and it does the rest.
 - **Checks and installs what is missing.** Detects `git` and `gh`, asks before installing, and starts `gh auth login` if you are not logged in.
 - **New or existing repositories.** No `.git` yet: one is created. Existing `.git`: it is updated and pushed.
+- **Follows your current GitHub login.** If a folder's `origin` points at another account (you switched `gh auth login`), the remote is switched to a repository of the same name under *your current* account. Your history is kept.
+- **Overwrites by default.** If a repository with that name already exists and its content differs, it is overwritten with the folder's content. `--safe` turns this off.
+- **Login happens on the spot.** Not logged in? `gh auth login` starts immediately, and the upload continues as soon as you finish.
 - **One folder, many folders, or all folders.** Each folder becomes its own repository, named after the folder.
 - **Large files just work.** Files over 25 MB go to Git LFS automatically, up to GitHub's per-file cap.
-- **Honest results.** A failed push is reported as a failure, with the likely fix, and the exit code reflects it.
+- **Honest results.** A failed folder is reported with the reason on its summary line, plus a ready-to-paste command to re-run just the failed folders. The exit code reflects it.
 - **Works everywhere.** Any Linux distribution (apt, dnf/yum, pacman, zypper, apk, xbps) and macOS (Homebrew), including macOS's stock bash 3.2.
 - **Rename it freely.** The script recognises itself by its real path, so `gitpush.sh`, `up`, or any other name works.
 
@@ -98,6 +102,7 @@ Do not `source gitup.sh`. The script refuses to run that way.
 | `./gitup.sh Meshtalk NotesApp` | Shorthand: folder names without `--folder` also work. |
 | `./gitup.sh --all -y` | Same as `--all`, without asking for confirmation. |
 | `./gitup.sh --all --private` | New repositories are created as private. |
+| `./gitup.sh --all --safe` | Never overwrite: stop on a folder whose GitHub repository has different history. |
 | `./gitup.sh --all --dry-run` | Only show which folders and repository names would be used. |
 | `GITUP_SKIP="scratch tmp" ./gitup.sh --all` | Also skip folders named `scratch` and `tmp`. |
 | `./gitup.sh --folder ./all` | Process a folder that is literally named `all`. |
@@ -136,6 +141,7 @@ Folder names that start with `-` must be written as `./-name`. Everything after 
 | `-n`, `--dry-run` | List the folders and repository names, then exit. Nothing is installed, created or pushed, and no login is needed. |
 | `--private` | Create **new** repositories as private. |
 | `--public` | Create new repositories as public. This is already the default. |
+| `--safe` (alias `--no-force`) | Never overwrite anything on GitHub, and never rewrite local history. See [Account switching and overwriting](#account-switching-and-overwriting). |
 | `-h`, `--help` | Show the built-in help. |
 
 > **New repositories are public by default.** Use `--private` if you do not want that. The setting only affects repositories the script creates; it never changes the visibility of an existing repository.
@@ -167,10 +173,14 @@ For every folder, in order:
 5. **Large files.** Files over the LFS threshold are set up for Git LFS. See [Large files and Git LFS](#large-files-and-git-lfs).
 6. **Stage and commit.** Everything git would normally add is staged (`.gitignore` is respected). The commit message is `Initial commit` the first time and `Update from gitup.sh YYYY-MM-DD HH:MM:SS` afterwards. With nothing new, no commit is made, but any unpushed commits are still pushed.
 7. **Remote.**
-   - If the repository already has a remote (`origin`, or the first one it has), that remote is used.
-   - Otherwise the script looks for `<your-username>/<folder-name>` on GitHub. If it exists, it is attached. If it does not, it is created, public unless you passed `--private`. Any other answer from GitHub (network down, bad token) stops the folder instead of guessing.
+   - The repository's remote (`origin`, or the first one it has) is checked against GitHub. If your current login can push to it, it is used as it is.
+   - If it belongs to another account, does not exist, or cannot be written with your current login, the remote is **switched** to `<your-username>/<folder-name>` (`git remote set-url`). The local history is kept.
+   - If there is no remote, the script looks for `<your-username>/<folder-name>`. If it exists, the folder is uploaded into it. If not, it is created, public unless you passed `--private`.
+   - Remotes that are not on github.com are used as they are. Any other answer from GitHub (network down, bad token) stops the folder instead of guessing.
    - The clone URL uses your `gh` protocol setting (HTTPS or SSH).
-8. **Push.** LFS objects are uploaded first (when LFS is in use), then `git push -u <remote> <branch>`. Temporary network failures are retried (`GITUP_RETRIES`). The script **never force-pushes**.
+8. **New or switched remote, branch `master`.** The local branch is renamed to `main` (like `git branch -M main`), unless a `main` branch already exists. After the push, GitHub's default branch is set to the branch you pushed.
+9. **Big files in old history.** See [Large files and Git LFS](#large-files-and-git-lfs).
+10. **Push.** LFS objects are uploaded first (when LFS is in use), then `git push -u <remote> <branch>`. Temporary network failures are retried (`GITUP_RETRIES`). If GitHub says the remote branch has different history, the push is forced; see [Account switching and overwriting](#account-switching-and-overwriting).
 
 A folder with nothing to upload (empty, or everything ignored) is reported as skipped, not failed.
 
@@ -178,10 +188,13 @@ A folder with nothing to upload (empty, or everything ignored) is reported as sk
 
 - Inside each folder: `.git/` (if new), `.git/info/exclude`, and, only when LFS is used, `.gitattributes` and repo-local LFS hooks and filters.
 - Repo-local `user.name` / `user.email`, only when you have none configured.
+- The remote URL, when a remote pointed at another account or a missing repository (and the stale remote-tracking branches of that old remote).
+- The local branch name, when a `master` branch is renamed to `main` for a new or switched remote.
+- A backup ref `refs/gitup-backup/…`, when old history had to be rewritten for Git LFS.
 - Globally, `gh auth setup-git` makes `gh` the git credential helper for GitHub (it edits `~/.gitconfig`; this is how HTTPS pushes get authenticated).
 - A temporary file in `$TMPDIR` (or `/tmp`) that is removed when the script exits.
 
-Your files are never modified or deleted.
+Your working files are never modified or deleted, and `.git` is never deleted: gitup repoints and updates the existing repository, so your history survives.
 
 ## Repository names
 
@@ -241,13 +254,15 @@ Details:
 - GitHub limits the LFS storage and bandwidth included with each account. Many large files can use it up; see your GitHub billing page. To keep mid-size files out of LFS, raise `GITUP_LFS_MB` (up to 100).
 - GitHub also limits a single push (about 2 GB). Because large files go through LFS, normal pushes stay small.
 
-**A big file that is already in your commit history** (committed in the past without LFS) cannot be fixed by tracking it now. The push fails and the script prints the fix. If the repository was never pushed and nobody else has a copy:
+**A big file that is already in your commit history** (committed in the past without LFS, even if deleted later) would make GitHub reject the push. Before pushing to GitHub, the script checks the branch history for such files and, unless you use `--safe`:
 
-```bash
-git lfs migrate import --everything --above=100MB
-```
+1. saves the old tip as `refs/gitup-backup/<branch>-<timestamp>`,
+2. runs `git lfs migrate import --include-ref=refs/heads/<branch> --above=100MiB`, which moves those files into LFS and rewrites this branch's history,
+3. pushes the rewritten branch (overwriting the old one on GitHub if needed).
 
-This rewrites history, so do not use it on a repository others have cloned.
+The backup ref keeps the old history on your machine. Free the space later with `git update-ref -d <ref> && git gc --prune=now`. With `--safe`, the folder fails and the exact `git lfs migrate` command is printed.
+
+Rewriting history changes commit ids. That is fine for a repository only you use, but anyone else who cloned it would need to re-clone.
 
 ## The script never uploads itself
 
@@ -263,6 +278,23 @@ The script that is *currently running* is excluded from the upload, but only whe
 | It is installed on your `PATH` (for example `~/.local/bin`) | Nothing to exclude. |
 
 If an earlier run had already committed the running script, it is removed from the repository index and not uploaded again. An old-style rule that excluded the bare file name everywhere is cleaned up automatically.
+
+## Account switching and overwriting
+
+gitup is meant to be automatic, so it prefers to finish the upload over stopping to ask.
+
+**You switched GitHub accounts.** A folder was uploaded earlier under another account, and `origin` still points there. gitup asks GitHub whether your current login can push to that repository. If not, it creates (or reuses) `<your-username>/<folder-name>`, runs the equivalent of `git remote set-url origin …`, renames `master` to `main` if needed, and pushes. The folder's history comes along. Nothing is deleted from the old account.
+
+**A repository with the same name already exists on your account.** If the content is different (for example, you changed a few files locally and the GitHub copy is older, or it is a different project), gitup pushes with `--force` so GitHub ends up matching your folder:
+
+```text
+[WARN]  The remote branch 'main' has different history — overwriting it with this folder's content.
+[WARN]    (previous remote tip: 48c8a4f8c91014f92025c340299a44ba096c5cb2)
+```
+
+The previous tip commit is printed so you can find it again if any clone still has it (`git push origin <sha>:refs/heads/recovered` brings it back as a branch). Only the pushed branch is overwritten; other branches and the repository's settings are untouched.
+
+**Want a seat belt?** Use `--safe`. gitup then never force-pushes, never rewrites local history and stops with the exact merge command when GitHub has different history.
 
 ## Safety features
 
@@ -284,10 +316,6 @@ If a repository has **no `.gitignore` at all**, the script keeps these out for t
 
 A subfolder that has its own `.git` is added by git as an empty link, so its files are **not** uploaded. The script warns you when that happens.
 
-### No force pushes
-
-If GitHub says the remote has commits you do not have, the script stops and prints the command to merge them. Nothing on GitHub is overwritten.
-
 ## Dependencies and login
 
 **Missing `git` or `gh`:** the script lists what is missing and asks `Install them now using your package manager?` You may then be asked for your password (`sudo`, or `doas`). `-y` answers yes automatically. Without a terminal and without `-y` it explains and stops.
@@ -306,7 +334,7 @@ If GitHub says the remote has commits you do not have, the script stops and prin
 - On Arch, if pacman cannot find the package, run `sudo pacman -Syu` and try again.
 - **macOS:** `git` comes with the Command Line Tools (`xcode-select --install`) or Homebrew. Homebrew itself is not installed for you; get it from <https://brew.sh>.
 
-**Login:** if `gh` is not logged in to github.com, the script starts `gh auth login` and you follow its prompts. That needs a terminal. In automation, log in beforehand or set `GH_TOKEN`.
+**Login:** the script asks GitHub who you are (`gh api user`). If that fails because you are not logged in, `gh auth login` starts immediately, you follow its prompts, and the upload continues as soon as the login is finished. That needs a terminal. In automation, log in beforehand or set `GH_TOKEN`. If GitHub is merely unreachable (no network), the script says so instead of asking you to log in.
 
 ## Output, summary and exit codes
 
@@ -314,11 +342,16 @@ Messages are tagged `[INFO]`, `[ OK ]`, `[WARN]` and `[FAIL]` and are written to
 
 ```text
 [INFO]  Summary
-[ OK ]  Meshtalk  →  https://github.com/yourname/Meshtalk
+[ OK ]  Meshtalk  →  https://github.com/yourname/Meshtalk  (created, switched from olduser/Meshtalk)
+[ OK ]  Notes  →  https://github.com/yourname/Notes  (existing repo, overwrote existing remote content)
 [WARN]  scratch  →  skipped (nothing to upload)
-[FAIL]  বাংলা  →  failed
-[FAIL]  1 of 3 folder(s) failed.
+[FAIL]  Tools  →  failed: GitHub rejected your credentials (logged in as yourname). Try:  gh auth login   and   gh auth setup-git
+[FAIL]  1 of 4 folder(s) failed.
+[INFO]  After fixing the cause, re-run only the failed folders:
+    ./gitup.sh --folder Tools
 ```
+
+The text in parentheses lists what happened: `created`, `existing repo`, `switched from <old-owner/repo>`, `overwrote existing remote content`, `moved big files in history to LFS`, or `updated` for an ordinary push.
 
 | Exit code | Meaning |
 | --- | --- |
@@ -332,15 +365,19 @@ Messages are tagged `[INFO]`, `[ OK ]`, `[WARN]` and `[FAIL]` and are written to
 | --- | --- |
 | `HEAD is detached` | Check out a branch first: `git switch main`. |
 | `A merge/rebase/cherry-pick is in progress` | Finish or abort it, then re-run. |
-| `The remote branch has commits that this folder doesn't have` | Merge first: `git pull --no-rebase --allow-unrelated-histories origin <branch>`, then re-run. |
-| `The GitHub repo already exists and has a different history` | A repository with the folder's name already exists on your account. Rename the local folder, or merge as above. |
-| `A file over 100 MB is stored in the commit history without Git LFS` | See [Large files](#large-files-and-git-lfs): `git lfs migrate import --everything --above=100MB`. |
+| `The remote branch has different history (--safe mode…)` | You used `--safe`. Re-run without it to overwrite, or merge: `git pull --no-rebase --allow-unrelated-histories origin <branch>`. |
+| `The remote branch has different history and gitup could not overwrite it` | Usually branch protection or a repository rule; see the next rows. |
+| `Branch protection blocks this push` | Turn the protection off in the repository's Settings → Branches, then re-run. |
+| `The GitHub repository is archived` | Unarchive it under Settings → Danger Zone, then re-run. |
+| `Remote 'origin' (…) does not exist / can't be written to… switching it` | Not an error: gitup moved the remote to your current account. |
+| `Files in this folder's commit history are over 100 MB…` | Without `--safe` gitup fixes this itself (see [Large files](#large-files-and-git-lfs)). With `--safe`, run the printed `git lfs migrate import` command. |
 | `your login lacks the 'workflow' scope` | You are pushing `.github/workflows`. Run `gh auth refresh -h github.com -s workflow`. |
 | `GitHub blocked the push (secret scanning…)` | A real secret was detected. Remove it from the files and the commit, then re-run. |
 | `LFS storage/bandwidth quota exceeded` | Buy more LFS data, delete old LFS objects, or raise `GITUP_LFS_MB`. |
 | `GitHub rejected your credentials` | Run `gh auth login` and `gh auth setup-git`. |
-| `The remote repository was not found` | Check `git remote -v`; the repository may have been deleted or renamed. |
-| `No terminal available for login` | Log in first with `gh auth login`, or set `GH_TOKEN`. |
+| `The remote repository was not found` | A non-GitHub remote, or one deleted while pushing. Check `git remote -v`. |
+| `GitHub CLI is not logged in and there is no terminal` | Log in first with `gh auth login`, or set `GH_TOKEN`. |
+| `You appear to be logged in, but GitHub could not be reached` | Network or proxy problem. Check your connection and re-run. |
 | `Cannot derive a valid GitHub repository name` | Rename the folder using letters, digits, `.`, `_` or `-`. |
 | `Could not check GitHub for …` | Usually no network or an expired token. Try `gh auth status`. |
 | `Too large for GitHub … NOT uploaded` | That file is over `GITUP_LFS_MAX_MB`. Split it, host it elsewhere, or add it to `.gitignore`. |
@@ -353,5 +390,7 @@ Messages are tagged `[INFO]`, `[ OK ]`, `[WARN]` and `[FAIL]` and are written to
 - Repositories are created under your personal account, not under an organisation.
 - Folder names that contain no letters or digits from `A-Z`, `a-z`, `0-9` cannot become repository names.
 - Only the current branch is pushed; tags are not.
-- Existing repositories are never changed in visibility, name or settings.
+- Existing GitHub repositories are never changed in visibility, name or settings. The only exceptions are the pushed branch's content and, for a new or switched remote, the default branch.
+- Overwriting is per branch: only the branch being pushed is replaced.
+- If the old account's repository is still accessible to your new login (for example it is a collaborator repository you can push to), gitup keeps using it. Remove or change `origin` yourself if you want a copy under your own account.
 - Each folder is its own repository. Subfolders that have their own `.git` are not merged in.

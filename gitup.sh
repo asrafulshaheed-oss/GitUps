@@ -13,6 +13,8 @@
 #   -n, --dry-run   only show which folders / repo names would be used
 #       --private   create new repositories as private (default: public)
 #       --public    create new repositories as public (this is the default)
+#       --safe      never overwrite: stop when the GitHub repo has different history
+#                   (default: overwrite it with this folder's content)
 #   -h, --help      show this help
 #
 # Environment:
@@ -72,13 +74,15 @@ ASSUME_YES=0
 if [[ "${GITUP_YES:-0}" == "1" ]]; then ASSUME_YES=1; fi
 DRY_RUN=0
 WANT_ALL=0
+FORCE_OVERWRITE=1                           # --safe turns it off
 VISIBILITY="public"                         # new repos; --private switches it
 REQUESTED=()
 
 GH_LOGIN=""; GH_ID=""; GH_NAME=""; GH_EMAIL=""
 FOLDERS=(); SEEN=(); ALL_DIRS=(); SKIP_BIG=()
 RES_URL=""; RES_NOTE=""; SELF_REL=""
-SUM_DIRS=(); SUM_STATE=(); SUM_INFO=()
+SUM_DIRS=(); SUM_STATE=(); SUM_INFO=(); FAILED_DIRS=()
+FIRST_ERR=""; REMOTE_SETUP=0; REMOTE_NAME="origin"; REMOTE_URL=""
 TMP_FILE=""
 
 # ─── colours & logging (all to stderr) ────────────────────────────────────────
@@ -91,7 +95,10 @@ fi
 log_info() { printf '%s[INFO]%s  %s\n' "$BLUE"   "$NC" "$*" >&2; }
 log_ok()   { printf '%s[ OK ]%s  %s\n' "$GREEN"  "$NC" "$*" >&2; }
 log_warn() { printf '%s[WARN]%s  %s\n' "$YELLOW" "$NC" "$*" >&2; }
-log_err()  { printf '%s[FAIL]%s  %s\n' "$RED"    "$NC" "$*" >&2; }
+log_err()  {
+    printf '%s[FAIL]%s  %s\n' "$RED" "$NC" "$*" >&2
+    if [[ -z "$FIRST_ERR" ]]; then FIRST_ERR="$*"; fi
+}
 die()      { log_err "$*"; exit 1; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
@@ -137,6 +144,8 @@ Options:
   -n, --dry-run   only show which folders / repo names would be used
       --private   create new repositories as private (default: public)
       --public    create new repositories as public (this is the default)
+      --safe      never overwrite: stop when the GitHub repo has different history
+                  (default: overwrite it with this folder's content)
   -h, --help      show this help
 
 Environment:
@@ -152,6 +161,11 @@ How it works:
   • Each folder becomes its own repository, named after the folder
     (spaces → '-', unsupported characters removed).
   • No .git yet → one is created.  Existing .git → it is simply updated.
+  • If the folder's remote belongs to another GitHub account (for example you
+    switched `gh auth login`), the remote is switched to a repository of the
+    same name under YOUR current account. The local history is kept.
+  • If that repository already exists with different content, it is
+    overwritten with this folder (`--safe` stops instead).
   • Files over GITUP_LFS_MB are stored with Git LFS automatically.
   • A repo without a .gitignore skips node_modules, __pycache__, .venv,
     .DS_Store and Thumbs.db (local exclude only; nothing is added to the repo).
@@ -366,16 +380,19 @@ ensure_dependencies() {
 
 # ─── GitHub auth & identity ───────────────────────────────────────────────────
 ensure_auth() {
-    if gh auth status --hostname github.com >/dev/null 2>&1; then
+    local out=""
+    if out=$(gh api user --jq .login 2>&1) && [[ -n "$out" ]]; then
         log_ok "GitHub CLI is authenticated."
+    elif gh auth status --hostname github.com >/dev/null 2>&1; then
+        die "You appear to be logged in, but GitHub could not be reached: $out"
     else
-        log_warn "GitHub CLI is not logged in — starting 'gh auth login'…"
         if [[ ! -t 0 ]]; then
-            die "No terminal available for login. Run 'gh auth login' first, or set GH_TOKEN."
+            die "GitHub CLI is not logged in and there is no terminal for the login. Run 'gh auth login' first, or set GH_TOKEN."
         fi
+        log_warn "GitHub CLI is not logged in — starting 'gh auth login' now…"
         gh auth login --hostname github.com || die "Authentication failed."
-        gh auth status --hostname github.com >/dev/null 2>&1 || die "Still not authenticated after login."
-        log_ok "Authentication successful."
+        gh api user --jq .login >/dev/null 2>&1 || die "Still not authenticated after login."
+        log_ok "Login finished — continuing with the upload."
     fi
     gh auth setup-git >/dev/null 2>&1 || true
 }
@@ -534,9 +551,8 @@ diagnose_push_failure() {
     local f="$1" branch="$2"
     if grep -Eqi 'GH001|exceeds GitHub.s file size limit|Large files detected' "$f"; then
         log_err "A file over ${GH_HARD_MB} MB is stored in the commit history without Git LFS."
-        log_err "If this repo was never pushed (nobody else has a copy), rewrite its history once:"
-        log_err "    git lfs migrate import --everything --above=${GH_HARD_MB}MB"
-        log_err "then run this script again."
+        log_err "Re-run without --safe and gitup moves such files into Git LFS for you, or run:"
+        log_err "    git lfs migrate import --include-ref=refs/heads/${branch} --above=${GH_HARD_MB}MiB"
     elif grep -Eqi 'workflow.*scope|without .?workflow.? scope' "$f"; then
         log_err "GitHub refused workflow files (.github/workflows) — your login lacks the 'workflow' scope."
         log_err "Fix:  gh auth refresh -h github.com -s workflow"
@@ -546,17 +562,20 @@ diagnose_push_failure() {
     elif grep -Eqi 'quota|over its data|LFS.*(budget|limit exceeded)' "$f"; then
         log_err "GitHub LFS storage/bandwidth quota exceeded. Free accounts get limited LFS data."
         log_err "Buy more LFS data on GitHub, delete old LFS objects, or raise GITUP_LFS_MB so mid-size files skip LFS."
+    elif grep -Eqi 'archived' "$f"; then
+        log_err "The GitHub repository is archived (read-only). Unarchive it under Settings → Danger Zone, then re-run."
+    elif grep -Eqi 'protected branch|protected ref|cannot force.push|force.push.*(denied|blocked)' "$f"; then
+        log_err "Branch protection blocks this push. Turn it off in the repository's Settings → Branches, then re-run."
     elif grep -Eqi 'non-fast-forward|fetch first|tip of your current branch is behind' "$f"; then
-        if (( ATTACHED )); then
-            log_err "The GitHub repo already exists and has a different history than this folder."
-            log_err "Either rename the folder (repo names follow folder names) or merge manually:"
+        if (( FORCE_OVERWRITE )); then
+            log_err "The remote branch has different history and gitup could not overwrite it."
         else
-            log_err "The remote branch has commits that this folder doesn't have. Merge them first:"
+            log_err "The remote branch has different history (--safe mode: nothing was overwritten)."
+            log_err "Re-run without --safe to overwrite it, or merge first:"
+            log_err "    git pull --no-rebase --allow-unrelated-histories origin ${branch}"
         fi
-        log_err "    git pull --no-rebase --allow-unrelated-histories origin ${branch}"
-        log_err "then run this script again. (gitup never force-pushes.)"
-    elif grep -Eqi 'Authentication failed|could not read (Username|Password)|Permission denied \(publickey\)|HTTP Basic: Access denied|Support for password authentication|returned error: 403|invalid credentials' "$f"; then
-        log_err "GitHub rejected your credentials. Try:  gh auth login   and   gh auth setup-git"
+    elif grep -Eqi 'Authentication failed|could not read (Username|Password)|Permission denied \(publickey\)|HTTP Basic: Access denied|Support for password authentication|returned error: 403|invalid credentials|Permission to .* denied' "$f"; then
+        log_err "GitHub rejected your credentials (logged in as ${GH_LOGIN}). Try:  gh auth login   and   gh auth setup-git"
     elif grep -Eqi 'Repository not found|does not appear to be a git repository' "$f"; then
         log_err "The remote repository was not found. Check 'git remote -v' — it may have been deleted or renamed."
     else
@@ -564,21 +583,35 @@ diagnose_push_failure() {
     fi
 }
 
+add_note() {
+    if [[ -z "$RES_NOTE" ]]; then RES_NOTE="$1"; else RES_NOTE="${RES_NOTE}, $1"; fi
+}
+
 push_branch() {
-    local remote="$1" branch="$2"
+    local remote="$1" branch="$2" prev=""
     if have_lfs && repo_uses_lfs; then
         log_info "Uploading Git LFS objects to '$remote'…"
-        if ! run_with_retry "LFS upload" git lfs push "$remote" "$branch"; then
+        # --all: don't trust remote-tracking refs (they may point at an old account's repo)
+        if ! run_with_retry "LFS upload" git lfs push --all "$remote" "$branch"; then
             diagnose_push_failure "$TMP_FILE" "$branch"
             return 1
         fi
     fi
     log_info "Pushing '$branch' to '$remote'…"
-    if ! run_with_retry "git push" git push --progress -u "$remote" "$branch"; then
-        diagnose_push_failure "$TMP_FILE" "$branch"
-        return 1
+    if run_with_retry "git push" git push --progress -u "$remote" "$branch"; then
+        return 0
     fi
-    return 0
+    if (( FORCE_OVERWRITE )) && grep -Eqi 'non-fast-forward|fetch first|tip of your current branch is behind' "$TMP_FILE"; then
+        prev=$(git ls-remote "$remote" "refs/heads/$branch" 2>/dev/null | cut -f1 | head -n 1 || true)
+        log_warn "The remote branch '$branch' has different history — overwriting it with this folder's content."
+        if [[ -n "$prev" ]]; then log_warn "  (previous remote tip: ${prev})"; fi
+        if run_with_retry "forced push" git push --progress --force -u "$remote" "$branch"; then
+            add_note "overwrote existing remote content"
+            return 0
+        fi
+    fi
+    diagnose_push_failure "$TMP_FILE" "$branch"
+    return 1
 }
 
 # ─── repo naming & remote setup ───────────────────────────────────────────────
@@ -601,46 +634,61 @@ web_url() {
                            -e 's#\.git$##'
 }
 
-# Sets REMOTE_NAME, REMOTE_URL, RES_URL, ATTACHED, RES_NOTE (creates/attaches repo if needed)
-setup_remote() {
-    local dir="$1" base repo_name out rc=0 clone ssh html proto other
-    ATTACHED=0
-    REMOTE_NAME="origin"
-    REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
-    if [[ -n "$REMOTE_URL" ]]; then
-        RES_URL=$(web_url "$REMOTE_URL")
-        log_info "Using existing remote 'origin' → $REMOTE_URL"
-        return 0
-    fi
-    other=$(git remote 2>/dev/null | head -n 1 || true)
-    if [[ -n "$other" ]]; then
-        REMOTE_NAME="$other"
-        REMOTE_URL=$(git config --get "remote.$other.url" 2>/dev/null || true)
-        if [[ -n "$REMOTE_URL" ]]; then
-            RES_URL=$(web_url "$REMOTE_URL")
-            log_info "Using existing remote '$other' → $REMOTE_URL"
-            return 0
-        fi
-    fi
+is_github_url() {
+    case "$1" in
+        *github.com[:/]*) return 0 ;;
+    esac
+    return 1
+}
 
-    base=$(basename -- "$dir")
-    if ! repo_name=$(sanitize_repo_name "$base"); then
-        log_err "Cannot derive a valid GitHub repository name from folder '$base' (use letters, digits, '.', '_' or '-')."
+# Prints OWNER/NAME for a github.com remote URL (https, ssh, scp-style); fails for other hosts.
+github_slug() {
+    local s
+    is_github_url "$1" || return 1
+    s=$(printf '%s' "$1" | sed -E -e 's#^(https?|ssh|git)://([^/@]+@)?github\.com(:[0-9]+)?/##' \
+                                  -e 's#^[^@/:]+@github\.com:##' -e 's#\.git/?$##' -e 's#/+$##')
+    case "$s" in
+        */*/*|/*|*/|'') return 1 ;;
+        */*)            printf '%s' "$s" ;;
+        *)              return 1 ;;
+    esac
+}
+
+# Can the logged-in account push to OWNER/NAME?  Prints yes | no | missing | unknown,
+# or "error: …" (and returns 1) when GitHub could not be asked.
+repo_access_state() {
+    local out rc=0
+    out=$(gh api "repos/$1" --jq '.permissions.push' 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        case "$out" in
+            true)  echo yes ;;
+            false) echo no ;;
+            *)     echo unknown ;;
+        esac
+    elif [[ "$out" == *"404"* || "$out" == *"Not Found"* ]]; then
+        echo missing
+    elif [[ "$out" == *"403"* ]]; then
+        echo no
+    else
+        printf 'error: %s\n' "$out"
         return 1
     fi
-    if [[ "$repo_name" != "$base" ]]; then
-        log_warn "Repository name sanitised: '$base' → '$repo_name'."
-    fi
+}
 
+# Makes sure $GH_LOGIN/NAME exists on GitHub (creating it if needed).
+# Sets REMOTE_URL and RES_URL.
+ensure_github_repo() {
+    local repo_name="$1" out rc=0 clone ssh html proto private_flag="true"
     out=$(gh api "repos/$GH_LOGIN/$repo_name" --jq '.clone_url, .ssh_url, .html_url' 2>&1) || rc=$?
     if (( rc == 0 )); then
-        ATTACHED=1
-        log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — attaching to it."
-        RES_NOTE="attached to existing repo"
+        if (( FORCE_OVERWRITE )); then
+            log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — uploading into it (its branch is overwritten if the history differs)."
+        else
+            log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — attaching to it."
+        fi
+        add_note "existing repo"
     elif [[ "$out" == *"404"* || "$out" == *"Not Found"* ]]; then
-        rc=0
         log_info "Creating ${VISIBILITY} GitHub repository '$repo_name'…"
-        local private_flag="true"
         if [[ "$VISIBILITY" == "public" ]]; then private_flag="false"; fi
         if ! out=$(gh api --method POST user/repos -f name="$repo_name" -F private="$private_flag" \
                         --jq '.clone_url, .ssh_url, .html_url' 2>&1); then
@@ -648,7 +696,7 @@ setup_remote() {
             return 1
         fi
         log_ok "Created repository $GH_LOGIN/$repo_name (${VISIBILITY})."
-        RES_NOTE="created"
+        add_note "created"
     else
         log_err "Could not check GitHub for '$repo_name': $out"
         return 1
@@ -665,7 +713,120 @@ setup_remote() {
     fi
     RES_URL="$html"
     if [[ -z "$RES_URL" ]]; then RES_URL=$(web_url "$REMOTE_URL"); fi
-    git remote add "$REMOTE_NAME" "$REMOTE_URL" || return 1
+    return 0
+}
+
+# Decides which remote to push to. Sets REMOTE_NAME, REMOTE_URL, RES_URL,
+# REMOTE_SETUP (1 when the remote was created / attached / switched this run).
+setup_remote() {
+    local dir="$1" base repo_name other slug state why old_slug="" switch=0 r
+    REMOTE_SETUP=0; REMOTE_NAME="origin"
+    REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+    if [[ -z "$REMOTE_URL" ]]; then
+        other=$(git remote 2>/dev/null | head -n 1 || true)
+        if [[ -n "$other" ]]; then
+            REMOTE_NAME="$other"
+            REMOTE_URL=$(git config --get "remote.$other.url" 2>/dev/null || true)
+        fi
+    fi
+
+    if [[ -n "$REMOTE_URL" ]]; then
+        RES_URL=$(web_url "$REMOTE_URL")
+        if ! slug=$(github_slug "$REMOTE_URL"); then
+            log_info "Using existing remote '$REMOTE_NAME' → $REMOTE_URL"
+            return 0
+        fi
+        if ! state=$(repo_access_state "$slug"); then
+            log_err "Could not check '$slug' on GitHub: ${state#error: }"
+            return 1
+        fi
+        case "$state" in
+            yes|unknown)
+                log_info "Using existing remote '$REMOTE_NAME' → $REMOTE_URL"
+                return 0 ;;
+            missing) why="does not exist (deleted, or private to another account)" ;;
+            *)       why="can't be written to with your current GitHub login (${GH_LOGIN})" ;;
+        esac
+        log_warn "Remote '$REMOTE_NAME' ($slug) $why — switching it to your own account."
+        old_slug="$slug"
+        switch=1
+    fi
+
+    base=$(basename -- "$dir")
+    if ! repo_name=$(sanitize_repo_name "$base"); then
+        log_err "Cannot derive a valid GitHub repository name from folder '$base' (use letters, digits, '.', '_' or '-')."
+        return 1
+    fi
+    if [[ "$repo_name" != "$base" ]]; then
+        log_warn "Repository name sanitised: '$base' → '$repo_name'."
+    fi
+
+    ensure_github_repo "$repo_name" || return 1
+
+    if (( switch )); then
+        git remote set-url "$REMOTE_NAME" "$REMOTE_URL" || return 1
+        # remote-tracking refs of the old account's repo are meaningless now
+        git for-each-ref --format='%(refname)' "refs/remotes/$REMOTE_NAME/" 2>/dev/null \
+            | while IFS= read -r r; do git update-ref -d "$r" 2>/dev/null || true; done
+        add_note "switched from ${old_slug}"
+        log_info "Remote '$REMOTE_NAME' now points to $REMOTE_URL"
+    else
+        git remote add "$REMOTE_NAME" "$REMOTE_URL" || return 1
+    fi
+    REMOTE_SETUP=1
+    return 0
+}
+
+# After (re)pointing a remote, make the GitHub default branch the one we pushed.
+align_default_branch() {
+    local branch="$1" slug cur
+    slug=$(github_slug "$REMOTE_URL") || return 0
+    cur=$(gh api "repos/$slug" --jq .default_branch 2>/dev/null || true)
+    if [[ -n "$cur" && "$cur" != "$branch" ]]; then
+        if gh api --method PATCH "repos/$slug" -f default_branch="$branch" >/dev/null 2>&1; then
+            log_info "GitHub default branch switched: $cur → $branch"
+        else
+            log_warn "Could not switch the GitHub default branch to '$branch' (it is '$cur')."
+        fi
+    fi
+    return 0
+}
+
+# GitHub rejects a push whose history contains a blob over 100 MiB that is not an LFS pointer.
+# Detect that up front and, unless --safe, move those files into Git LFS (history rewrite of
+# this branch only; the old history stays reachable under refs/gitup-backup/).
+fix_large_history() {
+    local branch="$1" big f backup limit oldtip
+    limit=$(( GH_HARD_MB * 1048576 ))
+    big=$(git rev-list --objects "refs/heads/$branch" 2>/dev/null \
+          | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' 2>/dev/null \
+          | awk -v lim="$limit" '$1 == "blob" && $2 + 0 > lim' | cut -d' ' -f3- | head -n 5 || true)
+    if [[ -z "$big" ]]; then return 0; fi
+
+    log_warn "Files in this folder's commit history are over ${GH_HARD_MB} MB and not in Git LFS (GitHub would reject the push):"
+    printf '%s\n' "$big" | while IFS= read -r f; do log_warn "    $f"; done
+    if (( ! FORCE_OVERWRITE )); then
+        log_err "Rewrite the history once with:  git lfs migrate import --include-ref=refs/heads/${branch} --above=${GH_HARD_MB}MiB   (or re-run without --safe)"
+        return 1
+    fi
+    if ! have_lfs && ! ensure_lfs; then
+        log_err "Git LFS is required to fix the history, but it is not available."
+        return 1
+    fi
+    lfs_activate || return 1
+    oldtip=$(git rev-parse "refs/heads/$branch") || return 1
+    backup="refs/gitup-backup/${branch}-$(date '+%Y%m%d%H%M%S')"
+    git update-ref "$backup" "$oldtip" || return 1
+    log_info "Moving those files into Git LFS (rewrites this folder's history; the old history stays at $backup)…"
+    if ! git lfs migrate import --include-ref="refs/heads/$branch" --above="${GH_HARD_MB}MiB"; then
+        git update-ref "$backup" "$oldtip" 2>/dev/null || true
+        log_err "git lfs migrate failed; your original history is untouched (also saved at $backup)."
+        return 1
+    fi
+    # `migrate` also rewrites other refs that pointed at the old tip — including our backup. Restore it.
+    git update-ref "$backup" "$oldtip" || true
+    log_info "Old history kept locally at $backup (free the space later with:  git update-ref -d $backup && git gc --prune=now)."
+    add_note "moved big files in history to LFS"
     return 0
 }
 
@@ -739,7 +900,7 @@ process_dir_impl() {
     local dir="$1" phys branch gp excl parent err pat rel f msg risky
     local self_base tmp grep_rc
     local -a addargs=()
-    RES_URL=""; RES_NOTE=""; SELF_REL=""; ATTACHED=0
+    RES_URL=""; RES_NOTE=""; SELF_REL=""; REMOTE_SETUP=0
 
     phys=$(pwd -P)
 
@@ -890,15 +1051,28 @@ process_dir_impl() {
 
     # 9. remote + push ----------------------------------------------------------
     setup_remote "$dir" || return 1
+
+    # Brand-new / switched remote: follow the usual `git branch -M main` convention.
+    if (( REMOTE_SETUP )) && [[ "$branch" == "master" ]] && ! git show-ref --verify --quiet refs/heads/main; then
+        if git branch -M main; then
+            branch="main"
+            log_info "Renamed local branch 'master' → 'main' for the new remote."
+        fi
+    fi
+
+    if is_github_url "$REMOTE_URL"; then
+        fix_large_history "$branch" || return 1
+    fi
     push_branch "$REMOTE_NAME" "$branch" || return 1
-    if [[ -z "$RES_NOTE" ]]; then RES_NOTE="pushed"; fi
+    if (( REMOTE_SETUP )); then align_default_branch "$branch"; fi
+    if [[ -z "$RES_NOTE" ]]; then RES_NOTE="updated"; fi
     log_ok "Done: $RES_URL"
     return 0
 }
 
 process_directory() {
     local dir="$1" prev="$PWD" rc=0
-    RES_URL=""; RES_NOTE=""
+    RES_URL=""; RES_NOTE=""; FIRST_ERR=""
     if ! cd -- "$dir"; then
         log_err "Cannot enter '$dir'"
         return 1
@@ -919,6 +1093,7 @@ parse_args() {
             --all)        WANT_ALL=1; shift ;;
             --public)     VISIBILITY="public"; shift ;;
             --private)    VISIBILITY="private"; shift ;;
+            --safe|--no-force) FORCE_OVERWRITE=0; shift ;;
             --folder|--folders)
                 shift
                 got=0
@@ -1056,9 +1231,10 @@ main() {
         process_directory "$f" || rc=$?
         SUM_DIRS+=("$(basename -- "$f")")
         case $rc in
-            0) SUM_STATE+=("OK");   SUM_INFO+=("${RES_URL}") ;;
+            0) SUM_STATE+=("OK");   SUM_INFO+=("${RES_URL}  (${RES_NOTE})") ;;
             2) SUM_STATE+=("SKIP"); SUM_INFO+=("${RES_NOTE}"); skipped=$(( skipped + 1 )) ;;
-            *) SUM_STATE+=("FAIL"); SUM_INFO+=("see messages above"); failures=$(( failures + 1 )) ;;
+            *) SUM_STATE+=("FAIL"); SUM_INFO+=("${FIRST_ERR:-see the messages above}")
+               FAILED_DIRS+=("$f"); failures=$(( failures + 1 )) ;;
         esac
     done
 
@@ -1068,12 +1244,21 @@ main() {
         case "${SUM_STATE[$i]}" in
             OK)   log_ok   "${SUM_DIRS[$i]}  →  ${SUM_INFO[$i]}" ;;
             SKIP) log_warn "${SUM_DIRS[$i]}  →  skipped (${SUM_INFO[$i]})" ;;
-            *)    log_err  "${SUM_DIRS[$i]}  →  failed" ;;
+            *)    log_err  "${SUM_DIRS[$i]}  →  failed: ${SUM_INFO[$i]}" ;;
         esac
     done
 
     if (( failures > 0 )); then
         log_err "${failures} of ${total} folder(s) failed."
+        log_info "After fixing the cause, re-run only the failed folders:"
+        printf '    %q --folder' "$0" >&2
+        for f in "${FAILED_DIRS[@]}"; do
+            case "$f" in
+                "$PWD"/*) f="${f#"$PWD"/}" ;;
+            esac
+            printf ' %q' "$f" >&2
+        done
+        printf '\n' >&2
         exit 1
     fi
     log_ok "Done — $(( total - skipped )) of ${total} folder(s) uploaded."
