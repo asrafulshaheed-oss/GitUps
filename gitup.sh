@@ -13,8 +13,10 @@
 #   -n, --dry-run   only show which folders / repo names would be used
 #       --private   create new repositories as private (default: public)
 #       --public    create new repositories as public (this is the default)
-#       --safe      never overwrite: stop when the GitHub repo has different history
-#                   (default: overwrite it with this folder's content)
+#       --safe      never overwrite or rewrite anything: keep the existing .git, and
+#                   stop when the GitHub repo has different history
+#       --keep-git  keep a folder's existing .git instead of replacing it
+#       --fresh     always replace the folder's .git with a fresh one
 #   -h, --help      show this help
 #
 # Environment:
@@ -23,6 +25,9 @@
 #   GITUP_LFS_MB=25             files bigger than this go to Git LFS   (max 100)
 #   GITUP_LFS_MAX_MB=2048       files bigger than this can't be uploaded at all
 #   GITUP_RETRIES=3             attempts for network operations
+#   GITUP_RATE_RETRIES=4        waits when GitHub throttles repo creation (0 = don't wait)
+#   GITUP_RATE_WAIT=60          first wait in seconds (doubles each time)
+#   GITUP_CREATE_DELAY=3        pause in seconds between repository creations
 #   GITUP_PKG_MANAGER=NAME      force apt-get|dnf|yum|pacman|zypper|apk|xbps-install|brew
 #   GITUP_NO_DEFAULT_IGNORE=1   don't add default ignores to repos w/o .gitignore
 #
@@ -75,6 +80,12 @@ if [[ "${GITUP_YES:-0}" == "1" ]]; then ASSUME_YES=1; fi
 DRY_RUN=0
 WANT_ALL=0
 FORCE_OVERWRITE=1                           # --safe turns it off
+GIT_MODE="auto"                             # auto | keep (--keep-git, --safe) | always (--fresh)
+RATE_RETRIES="${GITUP_RATE_RETRIES:-4}"     # waits when GitHub throttles repo creation
+RATE_WAIT="${GITUP_RATE_WAIT:-60}"          # first wait in seconds; doubles each time
+CREATE_DELAY="${GITUP_CREATE_DELAY:-3}"     # pause between repository creations
+RATE_BLOCKED=0; LAST_CREATE=0; CREATE_OUT=""
+FRESH_REPO=0; OLD_ORIGIN=""; BACKUP_PATH=""; LFS_ALL=1
 VISIBILITY="public"                         # new repos; --private switches it
 REQUESTED=()
 
@@ -144,8 +155,10 @@ Options:
   -n, --dry-run   only show which folders / repo names would be used
       --private   create new repositories as private (default: public)
       --public    create new repositories as public (this is the default)
-      --safe      never overwrite: stop when the GitHub repo has different history
-                  (default: overwrite it with this folder's content)
+      --safe      never overwrite or rewrite anything: keep the existing .git, and
+                  stop when the GitHub repo has different history
+      --keep-git  keep a folder's existing .git instead of replacing it
+      --fresh     always replace the folder's .git with a fresh one
   -h, --help      show this help
 
 Environment:
@@ -154,18 +167,27 @@ Environment:
   GITUP_LFS_MB=25             files bigger than this go to Git LFS (max 100)
   GITUP_LFS_MAX_MB=2048       files bigger than this can't be uploaded at all
   GITUP_RETRIES=3             attempts for network operations
+  GITUP_RATE_RETRIES=4        waits when GitHub throttles repo creation (0 = don't wait)
+  GITUP_RATE_WAIT=60          first wait in seconds (doubles each time)
+  GITUP_CREATE_DELAY=3        pause in seconds between repository creations
   GITUP_PKG_MANAGER=NAME      force apt-get|dnf|yum|pacman|zypper|apk|xbps-install|brew
   GITUP_NO_DEFAULT_IGNORE=1   don't add default ignores to repos w/o .gitignore
 
 How it works:
   • Each folder becomes its own repository, named after the folder
     (spaces → '-', unsupported characters removed).
-  • No .git yet → one is created.  Existing .git → it is simply updated.
-  • If the folder's remote belongs to another GitHub account (for example you
-    switched `gh auth login`), the remote is switched to a repository of the
-    same name under YOUR current account. The local history is kept.
-  • If that repository already exists with different content, it is
-    overwritten with this folder (`--safe` stops instead).
+  • A folder's old .git is replaced by a fresh one (the old one is MOVED to
+    <parent>/.gitup-backups/, not deleted), then it runs the equivalent of
+    `git remote add origin …; git branch -M main; git push -u origin main`.
+    Repositories gitup created itself are simply updated on later runs.
+    (`--keep-git` keeps your own .git as it is.)
+  • The remote is always YOUR current account's repo named after the folder,
+    even if the old .git pointed at another account.
+  • If that repository already exists, the folder's content is put on top of
+    its history (nothing is force-pushed; files that are gone locally are
+    removed). `--safe` stops instead.
+  • If GitHub throttles repository creation (secondary rate limit), gitup
+    waits and retries, then tells you to re-run later.
   • Files over GITUP_LFS_MB are stored with Git LFS automatically.
   • A repo without a .gitignore skips node_modules, __pycache__, .venv,
     .DS_Store and Thumbs.db (local exclude only; nothing is added to the repo).
@@ -589,10 +611,13 @@ add_note() {
 
 push_branch() {
     local remote="$1" branch="$2" prev=""
+    local -a lfs_opts=()
+    if (( LFS_ALL )); then lfs_opts=(--all); fi
     if have_lfs && repo_uses_lfs; then
         log_info "Uploading Git LFS objects to '$remote'…"
-        # --all: don't trust remote-tracking refs (they may point at an old account's repo)
-        if ! run_with_retry "LFS upload" git lfs push --all "$remote" "$branch"; then
+        # --all (default): don't trust remote-tracking refs, they may belong to another repo.
+        # Not used after adopting GitHub's history: those objects are already on the server.
+        if ! run_with_retry "LFS upload" git lfs push ${lfs_opts[@]+"${lfs_opts[@]}"} "$remote" "$branch"; then
             diagnose_push_failure "$TMP_FILE" "$branch"
             return 1
         fi
@@ -675,30 +700,104 @@ repo_access_state() {
     fi
 }
 
+# One short line out of a `gh api` error (gh prints the JSON body, then a "gh: …" line).
+short_gh_error() {
+    local t="$1" line
+    if [[ "$t" == *"gh: "* ]]; then line="${t##*gh: }"; else line="$t"; fi
+    line="${line%%$'\n'*}"
+    if (( ${#line} > 220 )); then line="${line:0:220}…"; fi
+    printf '%s' "$line"
+}
+
+is_rate_limited() {
+    case "$1" in
+        *"secondary rate limit"*|*"rate limit"*|*"abuse detection"*|*"retry-after"*|*"Retry-After"*) return 0 ;;
+    esac
+    return 1
+}
+
+# GitHub throttles bursts of repository creation; keep a small gap between them.
+pace_creation() {
+    local now gap
+    if (( CREATE_DELAY > 0 && LAST_CREATE > 0 )); then
+        now=$(date +%s)
+        gap=$(( LAST_CREATE + CREATE_DELAY - now ))
+        if (( gap > 0 )); then sleep "$gap"; fi
+    fi
+}
+
+# Creates $GH_LOGIN/NAME, waiting out GitHub's "secondary rate limit" when it kicks in.
+# Sets CREATE_OUT (the three URL lines). Returns 0 = created, 1 = failed, 3 = it already exists.
+create_github_repo() {
+    local name="$1" private_flag="true" tries=0 wait="$RATE_WAIT" out rc
+    if [[ "$VISIBILITY" == "public" ]]; then private_flag="false"; fi
+    while true; do
+        pace_creation
+        rc=0
+        out=$(gh api --method POST user/repos -f name="$name" -F private="$private_flag" \
+                --jq '.clone_url, .ssh_url, .html_url' 2>&1) || rc=$?
+        LAST_CREATE=$(date +%s)
+        if (( rc == 0 )); then
+            CREATE_OUT="$out"; RATE_BLOCKED=0
+            return 0
+        fi
+        if is_rate_limited "$out"; then
+            if (( RATE_BLOCKED || tries >= RATE_RETRIES )); then
+                RATE_BLOCKED=1
+                log_err "GitHub is temporarily blocking repository creation for your account (rate limit) — wait a while, then re-run."
+                log_info "This is GitHub-side throttling, not a problem with this folder. It usually lifts within minutes to an hour (longer for brand-new accounts). Folders whose repository already exists are not affected."
+                return 1
+            fi
+            tries=$(( tries + 1 ))
+            log_warn "GitHub is rate-limiting repository creation — waiting ${wait}s, then retrying (${tries}/${RATE_RETRIES}). Ctrl-C stops."
+            sleep "$wait"
+            wait=$(( wait * 2 ))
+            if (( wait > 600 )); then wait=600; fi
+            continue
+        fi
+        case "$out" in
+            *"already exists"*) return 3 ;;
+        esac
+        log_err "Could not create repository '$name': $(short_gh_error "$out")"
+        return 1
+    done
+}
+
 # Makes sure $GH_LOGIN/NAME exists on GitHub (creating it if needed).
 # Sets REMOTE_URL and RES_URL.
 ensure_github_repo() {
-    local repo_name="$1" out rc=0 clone ssh html proto private_flag="true"
-    out=$(gh api "repos/$GH_LOGIN/$repo_name" --jq '.clone_url, .ssh_url, .html_url' 2>&1) || rc=$?
-    if (( rc == 0 )); then
-        if (( FORCE_OVERWRITE )); then
-            log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — uploading into it (its branch is overwritten if the history differs)."
-        else
-            log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — attaching to it."
+    local repo_name="$1" out="" rc crc pass found=0 clone ssh html proto
+    # shellcheck disable=SC2034  # two passes: the second one re-reads a repo that appeared meanwhile
+    for pass in 1 2; do
+        rc=0
+        out=$(gh api "repos/$GH_LOGIN/$repo_name" --jq '.clone_url, .ssh_url, .html_url' 2>&1) || rc=$?
+        if (( rc == 0 )); then
+            if (( FORCE_OVERWRITE )); then
+                log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — its content will be replaced with this folder's."
+            else
+                log_warn "GitHub repo '$GH_LOGIN/$repo_name' already exists — attaching to it."
+            fi
+            add_note "existing repo"
+            found=1; break
         fi
-        add_note "existing repo"
-    elif [[ "$out" == *"404"* || "$out" == *"Not Found"* ]]; then
-        log_info "Creating ${VISIBILITY} GitHub repository '$repo_name'…"
-        if [[ "$VISIBILITY" == "public" ]]; then private_flag="false"; fi
-        if ! out=$(gh api --method POST user/repos -f name="$repo_name" -F private="$private_flag" \
-                        --jq '.clone_url, .ssh_url, .html_url' 2>&1); then
-            log_err "Could not create repository '$repo_name': $out"
+        if [[ "$out" != *"404"* && "$out" != *"Not Found"* ]]; then
+            log_err "Could not check GitHub for '$repo_name': $(short_gh_error "$out")"
             return 1
         fi
-        log_ok "Created repository $GH_LOGIN/$repo_name (${VISIBILITY})."
-        add_note "created"
-    else
-        log_err "Could not check GitHub for '$repo_name': $out"
+        log_info "Creating ${VISIBILITY} GitHub repository '$repo_name'…"
+        crc=0
+        create_github_repo "$repo_name" || crc=$?
+        if (( crc == 0 )); then
+            out="$CREATE_OUT"
+            log_ok "Created repository $GH_LOGIN/$repo_name (${VISIBILITY})."
+            add_note "created"
+            found=1; break
+        fi
+        if (( crc != 3 )); then return 1; fi
+        # it appeared in the meantime (or differs only in letter case): look it up again
+    done
+    if (( ! found )); then
+        log_err "GitHub says '$repo_name' already exists, but it can't be read with your login (${GH_LOGIN})."
         return 1
     fi
 
@@ -792,13 +891,66 @@ align_default_branch() {
     return 0
 }
 
+# Moves the folder's own .git out of the way (it is never deleted) so a fresh repository
+# can be created. Sets BACKUP_PATH. Backups live next to the project folders, in
+# <parent>/.gitup-backups/ (same filesystem → instant); falls back to ~/.cache.
+retire_git_dir() {
+    local phys="$1" stamp base dest root
+    stamp=$(date '+%Y%m%d-%H%M%S')
+    base=$(basename -- "$phys")
+    root="$(dirname -- "$phys")/.gitup-backups"
+    dest="$root/${base}-${stamp}.git"
+    if mkdir -p -- "$root" 2>/dev/null && mv -- .git "$dest" 2>/dev/null; then
+        BACKUP_PATH="$dest"; return 0
+    fi
+    root="${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gitup-backups"
+    dest="$root/${base}-${stamp}.git"
+    if mkdir -p -- "$root" 2>/dev/null && mv -- .git "$dest" 2>/dev/null; then
+        BACKUP_PATH="$dest"; return 0
+    fi
+    return 1
+}
+
+# A fresh repository knows nothing about what is already on GitHub. If the repository there
+# already has this branch, put this folder's content on top of it: a normal fast-forward push,
+# nothing is force-pushed, the old history stays, and files that no longer exist locally are
+# removed (the remote ends up matching the folder).
+adopt_remote_history() {
+    local branch="$1" ref rtip new msg
+    if (( ! FRESH_REPO || ! FORCE_OVERWRITE )); then return 0; fi
+    if ! git ls-remote --exit-code --heads "$REMOTE_NAME" "$branch" >/dev/null 2>&1; then
+        return 0        # no such branch there yet (or unreachable: the push will explain)
+    fi
+    ref="refs/remotes/$REMOTE_NAME/$branch"
+    log_info "GitHub already has '$branch' — putting this folder's content on top of it."
+    if ! run_with_retry "fetch" git fetch --no-tags --quiet "$REMOTE_NAME" "+refs/heads/$branch:$ref"; then
+        log_warn "Could not read the existing '$branch' from GitHub — trying a direct push instead."
+        return 0
+    fi
+    rtip=$(git rev-parse --verify -q "$ref^{commit}") || return 0
+    LFS_ALL=0
+    if [[ "$(git rev-parse "$rtip^{tree}")" == "$(git rev-parse 'HEAD^{tree}')" ]]; then
+        git update-ref "refs/heads/$branch" "$rtip" || return 0
+        add_note "already identical on GitHub"
+        return 0
+    fi
+    msg="Update from gitup.sh $(date '+%Y-%m-%d %H:%M:%S')"
+    if new=$(git commit-tree 'HEAD^{tree}' -p "$rtip" -m "$msg") && git update-ref "refs/heads/$branch" "$new"; then
+        add_note "content replaced, history kept"
+    else
+        LFS_ALL=1
+        log_warn "Could not build the update on top of GitHub's history — trying a direct push instead."
+    fi
+    return 0
+}
+
 # GitHub rejects a push whose history contains a blob over 100 MiB that is not an LFS pointer.
 # Detect that up front and, unless --safe, move those files into Git LFS (history rewrite of
 # this branch only; the old history stays reachable under refs/gitup-backup/).
 fix_large_history() {
     local branch="$1" big f backup limit oldtip
     limit=$(( GH_HARD_MB * 1048576 ))
-    big=$(git rev-list --objects "refs/heads/$branch" 2>/dev/null \
+    big=$(git rev-list --objects "refs/heads/$branch" --not --remotes="$REMOTE_NAME" 2>/dev/null \
           | git cat-file --batch-check='%(objecttype) %(objectsize) %(rest)' 2>/dev/null \
           | awk -v lim="$limit" '$1 == "blob" && $2 + 0 > lim' | cut -d' ' -f3- | head -n 5 || true)
     if [[ -z "$big" ]]; then return 0; fi
@@ -897,7 +1049,7 @@ add_folder() {
 # ─── per-folder work ──────────────────────────────────────────────────────────
 # Returns 0 = done, 1 = failed, 2 = skipped (nothing to upload).
 process_dir_impl() {
-    local dir="$1" phys branch gp excl parent err pat rel f msg risky
+    local dir="$1" phys branch gp excl parent err pat rel f msg risky slug
     local self_base tmp grep_rc
     local -a addargs=()
     RES_URL=""; RES_NOTE=""; SELF_REL=""; REMOTE_SETUP=0
@@ -905,6 +1057,21 @@ process_dir_impl() {
     phys=$(pwd -P)
 
     # 1. repository ----------------------------------------------------------
+    FRESH_REPO=0; OLD_ORIGIN=""; LFS_ALL=1
+    if [[ -e .git && "$GIT_MODE" != "keep" ]]; then
+        # A .git that gitup created earlier is simply updated; any other .git is replaced by
+        # a fresh one (the old one is moved aside, not deleted).
+        if [[ "$GIT_MODE" == "always" ]] || [[ "$(git config --local --get gitup.managed 2>/dev/null || true)" != "true" ]]; then
+            OLD_ORIGIN=$(git config --local --get remote.origin.url 2>/dev/null || true)
+            if retire_git_dir "$phys"; then
+                log_warn "Replacing the existing .git with a fresh one. The old one is saved at: $BACKUP_PATH"
+                add_note "new .git"
+            else
+                log_err "Could not move the old .git out of the way (read-only folder or disk?). Fix that, or use --keep-git to keep using it."
+                return 1
+            fi
+        fi
+    fi
     if [[ -e .git ]]; then
         if ! err=$(git rev-parse --git-dir 2>&1 >/dev/null); then
             log_err "'.git' exists but git cannot use it: $err"
@@ -917,10 +1084,17 @@ process_dir_impl() {
             log_warn "This folder sits inside another git repository ($parent) — creating a separate repository here."
         fi
         if ! git init -q; then log_err "git init failed."; return 1; fi
-        if [[ -z "$(git config --get init.defaultBranch 2>/dev/null || true)" ]]; then
-            git symbolic-ref HEAD refs/heads/main || return 1
-        fi
+        # like `git branch -M main`: a repository made by gitup always starts on main
+        git symbolic-ref HEAD refs/heads/main || return 1
+        git config --local gitup.managed true || true
+        FRESH_REPO=1
         log_ok "Initialised a new git repository."
+        # an old remote that already lives on THIS account is kept; anything else is replaced
+        if [[ -n "$OLD_ORIGIN" ]] && slug=$(github_slug "$OLD_ORIGIN"); then
+            if [[ "$(printf '%s' "${slug%%/*}" | tr '[:upper:]' '[:lower:]')" == "$(printf '%s' "$GH_LOGIN" | tr '[:upper:]' '[:lower:]')" ]]; then
+                git remote add origin "$OLD_ORIGIN" || true
+            fi
+        fi
     fi
 
     # 2. branch must be sane -------------------------------------------------
@@ -941,6 +1115,8 @@ process_dir_impl() {
     # 4. local-only excludes (never committed) --------------------------------
     excl=$(git rev-parse --git-path info/exclude 2>/dev/null || true)
     if [[ -z "$excl" ]]; then excl=".git/info/exclude"; fi
+
+    if [[ -d .gitup-backups ]]; then exclude_add "$excl" "/.gitup-backups/" || true; fi
 
     # 4a. running script: excluded only if it lives inside this repo
     case "$SELF_PATH" in
@@ -1060,11 +1236,12 @@ process_dir_impl() {
         fi
     fi
 
+    adopt_remote_history "$branch"
     if is_github_url "$REMOTE_URL"; then
         fix_large_history "$branch" || return 1
     fi
     push_branch "$REMOTE_NAME" "$branch" || return 1
-    if (( REMOTE_SETUP )); then align_default_branch "$branch"; fi
+    if (( REMOTE_SETUP || FRESH_REPO )); then align_default_branch "$branch"; fi
     if [[ -z "$RES_NOTE" ]]; then RES_NOTE="updated"; fi
     log_ok "Done: $RES_URL"
     return 0
@@ -1085,6 +1262,7 @@ process_directory() {
 # ─── argument parsing & main ──────────────────────────────────────────────────
 parse_args() {
     local got
+    KEEP_GIT_FLAG=0; FRESH_FLAG=0
     while (( $# )); do
         case "$1" in
             -h|--help)    show_help; exit 0 ;;
@@ -1094,6 +1272,8 @@ parse_args() {
             --public)     VISIBILITY="public"; shift ;;
             --private)    VISIBILITY="private"; shift ;;
             --safe|--no-force) FORCE_OVERWRITE=0; shift ;;
+            --keep-git)   KEEP_GIT_FLAG=1; shift ;;
+            --fresh)      FRESH_FLAG=1; shift ;;
             --folder|--folders)
                 shift
                 got=0
@@ -1122,6 +1302,13 @@ validate_settings() {
     if ! [[ "$LFS_MB" =~ $re ]] || (( LFS_MB < 1 )); then die "GITUP_LFS_MB must be a positive whole number."; fi
     if ! [[ "$LFS_MAX_MB" =~ $re ]] || (( LFS_MAX_MB < 1 )); then die "GITUP_LFS_MAX_MB must be a positive whole number."; fi
     if ! [[ "$RETRIES" =~ $re ]] || (( RETRIES < 1 )); then die "GITUP_RETRIES must be a positive whole number."; fi
+    if ! [[ "$RATE_RETRIES" =~ $re ]]; then die "GITUP_RATE_RETRIES must be a whole number (0 = don't wait)."; fi
+    if ! [[ "$RATE_WAIT" =~ $re ]] || (( RATE_WAIT < 1 )); then die "GITUP_RATE_WAIT must be a positive whole number of seconds."; fi
+    if ! [[ "$CREATE_DELAY" =~ $re ]]; then die "GITUP_CREATE_DELAY must be a whole number of seconds."; fi
+    if (( FRESH_FLAG && KEEP_GIT_FLAG )); then die "--fresh and --keep-git cannot be combined."; fi
+    if (( FRESH_FLAG && ! FORCE_OVERWRITE )); then die "--fresh and --safe cannot be combined."; fi
+    if (( FRESH_FLAG )); then GIT_MODE="always"; fi
+    if (( KEEP_GIT_FLAG || ! FORCE_OVERWRITE )); then GIT_MODE="keep"; fi
     if (( LFS_MB > GH_HARD_MB )); then
         log_warn "GITUP_LFS_MB=${LFS_MB} is above GitHub's ${GH_HARD_MB} MB file limit — using ${GH_HARD_MB}."
         LFS_MB=$GH_HARD_MB
@@ -1186,7 +1373,13 @@ main() {
         log_info "Dry run — ${total} folder(s) would be processed (new repositories: ${VISIBILITY}):"
         for f in "${FOLDERS[@]}"; do
             if [[ -e "$f/.git" ]]; then
-                label="existing repo"
+                if [[ "$GIT_MODE" == "keep" ]]; then
+                    label="existing repo — kept as it is"
+                elif [[ "$GIT_MODE" != "always" && "$(git -C "$f" config --local --get gitup.managed 2>/dev/null || true)" == "true" ]]; then
+                    label="existing gitup repo — updated"
+                else
+                    label="existing .git — replaced by a fresh one (old one saved aside)"
+                fi
             else
                 label="new repo: $(sanitize_repo_name "$(basename -- "$f")" || echo '(invalid name)')"
             fi
@@ -1251,7 +1444,10 @@ main() {
     if (( failures > 0 )); then
         log_err "${failures} of ${total} folder(s) failed."
         log_info "After fixing the cause, re-run only the failed folders:"
-        printf '    %q --folder' "$0" >&2
+        case "$0" in
+            */*) printf '    %q --folder' "$0" >&2 ;;
+            *)   printf '    bash %q --folder' "$0" >&2 ;;
+        esac
         for f in "${FAILED_DIRS[@]}"; do
             case "$f" in
                 "$PWD"/*) f="${f#"$PWD"/}" ;;
